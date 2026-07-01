@@ -1,0 +1,233 @@
+---
+title: "Appendix 1: Scenario 1 - Market Portfolio Perspective"
+output: html_document
+date: "2025-04-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Load required libraries
+set.seed(423)
+library(readr)
+library(dplyr)
+library(lubridate)
+library(glmnet)
+library(randomForest)
+library(caret)
+library(ggplot2)
+library(fastshap)
+# ----------------------------
+# Download and Load Dataset
+# ----------------------------
+# The Fama–French Global 3-Factor CSV is automatically downloaded via download.file()
+# and unzipped using read_csv() with a 6-line skip to remove metadata.
+# Columns are renamed to include standard identifiers (Mkt-RF, SMB, HML),
+# and the date column is parsed into proper Date format using the lubridate package.
+# A response variable (target) is then defined as the lead (next-month) of the market excess return,
+# aligning with the out-of-sample prediction goal.
+temp <- tempfile()
+base <- "http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/"
+factor <- "Global_3_Factors"
+format <- "_CSV.zip"
+full_url <- paste(base, factor, format, sep = "")
+download.file(full_url, temp, quiet = TRUE)
+Global_3_Factors <- read_csv(unz(temp, "Global_3_Factors.csv"), skip = 6) %>%
+rename(date = `...1`) %>%
+mutate_at(vars(-date),~ as.numeric(.)) %>%
+mutate(date = ymd(parse_date_time(date, "%Y%m", quiet = TRUE)))
+# ----------------------------
+# Prepare the Data
+# ----------------------------
+# Create a target variable: next month's Market excess return (Mkt-RF)
+data <- Global_3_Factors %>%
+arrange(date) %>%
+mutate(target = lead(`Mkt-RF`)) %>% # Shift Mkt-RF by one period
+filter(!is.na(target), !is.na(date)) # Remove rows with NA in target or date
+# ----------------------------
+# Function for Train-Test Split
+# ----------------------------
+# A custom split_data() function is created to divide the data into training and test sets.
+# Two splits are tested: 70/30 and 80/20, using a fixed random seed for reproducibility.
+```
+
+```{r, message=FALSE, warning=FALSE}
+set.seed(123)
+split_data <- function(df, ratio = 0.7) {
+n <- nrow(df)
+train_indices <- sample(seq_len(n), size = floor(ratio * n))
+list(train = df[train_indices, ],
+test = df[-train_indices, ])
+}
+# Three models are trained for performance comparison:
+# (1) OLS (baseline model) via lm()
+# (2) LASSO regression using glmnet::cv.glmnet(alpha = 1) with 10-fold CV to select lambda
+# (3) Random Forest using randomForest() with ntree = 500, mtry = sqrt(p), maxnodes = 30
+# All models are evaluated on the hold-out test set using:
+# - Mean Squared Error (MSE)
+# - Mean Absolute Error (MAE)
+# - R-squared (R2)
+# These metrics are printed and summarized in a table for comparison.
+# ----------------------------
+# Research Question 1:
+# Compare Baseline Linear Model vs. LASSO (70/30 Split)
+# ----------------------------
+split_70 <- split_data(data, ratio = 0.7)
+train_70 <- split_70$train
+test_70 <- split_70$test
+# Define predictors and response for training/testing
+x_train <- as.matrix(train_70 %>% select(SMB, HML))
+y_train <- train_70$target
+x_test <- as.matrix(test_70 %>% select(SMB, HML))
+y_test <- test_70$target
+# Baseline Linear Model (OLS)
+lm_model <- lm(target~ SMB + HML, data = train_70)
+lm_pred <- predict(lm_model, newdata = test_70)
+lm_mse <- mean((lm_pred- y_test)^2)
+lm_mae <- mean(abs(lm_pred- y_test))
+lm_r2 <- 1- sum((lm_pred- y_test)^2) / sum((y_test- mean(y_test))^2)
+lm_corr <- cor(lm_pred, y_test)
+cat("Baseline LM MSE (70/30 split):", lm_mse, "\n")
+```
+
+```{r, message=FALSE, warning=FALSE}
+# LASSO Regression (using glmnet)
+cv_lasso <- cv.glmnet(x_train, y_train, alpha = 1)
+lasso_pred <- predict(cv_lasso, s = cv_lasso$lambda.min, newx = x_test)
+lasso_mse <- mean((lasso_pred- y_test)^2)
+lasso_mae <- mean(abs(lasso_pred- y_test))
+lasso_r2 <- 1- sum((lasso_pred- y_test)^2) / sum((y_test- mean(y_test))^2)
+lasso_corr <- cor(lasso_pred, y_test)
+cat("LASSO MSE (70/30 split):", lasso_mse, "\n")
+```
+
+```{r, message=FALSE, warning=FALSE}
+# ----------------------------
+# Research Question 2:
+# Compare LASSO vs. Random Forest (70/30 Split)
+# ----------------------------
+# Random Forest Model
+rf_model <- randomForest(target~ SMB + HML, data = train_70)
+rf_pred <- predict(rf_model, newdata = test_70)
+rf_mse <- mean((rf_pred- y_test)^2)
+rf_mae <- mean(abs(rf_pred- y_test))
+rf_r2 <- 1- sum((rf_pred- y_test)^2) / sum((y_test- mean(y_test))^2)
+rf_corr <- cor(rf_pred, y_test)
+cat("Random Forest MSE (70/30 split):", rf_mse, "\n")
+```
+
+```{r, message=FALSE, warning=FALSE}
+# ----------------------------
+# Research Question 3:
+# Impact of Train-Test Split Ratios Using LASSO (80/20 Split)
+# ----------------------------
+split_80 <- split_data(data, ratio = 0.8)
+train_80 <- split_80$train
+test_80 <- split_80$test
+x_train80 <- as.matrix(train_80 %>% select(SMB, HML))
+y_train80 <- train_80$target
+x_test80 <- as.matrix(test_80 %>% select(SMB, HML))
+y_test80 <- test_80$target
+cv_lasso_80 <- cv.glmnet(x_train80, y_train80, alpha = 1)
+lasso_pred80 <- predict(cv_lasso_80, s = cv_lasso_80$lambda.min, newx = x_test80)
+lasso_mse80 <- mean((lasso_pred80- y_test80)^2)
+lasso80_mae <- mean(abs(lasso_pred80- y_test80))
+lasso80_r2 <- 1- sum((lasso_pred80- y_test80)^2) / sum((y_test80- mean(y_test80))^2)
+lasso80_corr <- cor(lasso_pred80, y_test80)
+cat("LASSO MSE (80/20 split):", lasso_mse80, "\n")
+```
+
+```{r, message=FALSE, warning=FALSE}
+# ----------------------------
+# Summarize Results in a Table
+# ----------------------------
+results <- data.frame(
+Model = c("Baseline LM", "LASSO (70/30)", "Random Forest (70/30)", "LASSO (80/20)"),
+Train_Test_Ratio = c("70/30", "70/30", "70/30", "80/20"),
+MSE = c(lm_mse, lasso_mse, rf_mse, lasso_mse80),
+MAE = c(lm_mae, lasso_mae, rf_mae, lasso80_mae),
+R2 = c(lm_r2, lasso_r2, rf_r2, lasso80_r2),
+Corr = c(lm_corr, lasso_corr, rf_corr, lasso80_corr)
+)
+print(results)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# ----------------------------
+# Visualize Results: Bar Plots for MSE, R-squared, and MAE
+# ----------------------------
+# Results are visualized using ggplot2 as bar plots for MSE, MAE, and R2.
+# This allows easy comparison across model types and train-test splits.
+p1 <- ggplot(results, aes(x = Model, y = MSE, fill = Train_Test_Ratio)) +
+geom_bar(stat = "identity", position = position_dodge()) +
+labs(title = "Model MSE Comparison",
+x = "Model", y = "Mean Squared Error (MSE)") +
+theme_minimal()
+p2 <- ggplot(results, aes(x = Model, y = R2, fill = Train_Test_Ratio)) +
+geom_bar(stat = "identity", position = position_dodge()) +
+labs(title = "Model R-squared Comparison",
+x = "Model", y = "R-squared") +
+theme_minimal()
+p3 <- ggplot(results, aes(x = Model, y = MAE, fill = Train_Test_Ratio)) +
+geom_bar(stat = "identity", position = position_dodge()) +
+labs(title = "Model MAE Comparison",
+x = "Model", y = "Mean Absolute Error (MAE)") +
+theme_minimal()
+print(p1)
+print(p2)
+print(p3)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# ----------------------------
+# SHAP Value Analysis for Model Interpretability
+# ----------------------------
+# To interpret model behavior, SHAP values are computed using the fastshap package:
+# - For Random Forest: a prediction wrapper is used on the test subset
+# - For LASSO: prediction extracted from glmnet.fit using best lambda
+# SHAP scatter plots are shown to visualize feature influence.
+# Define prediction wrappers for fastshap
+# For Random Forest:
+pred_rf <- function(model, newdata) {
+predict(model, newdata = newdata)
+}
+# For LASSO: Use the cv.glmnet object; extract predictions from the underlying glmnet.fit.
+pred_lasso <- function(model, newdata) {
+as.vector(predict(model$glmnet.fit, newx = as.matrix(newdata), s = model$lambda.min))
+}
+# Compute SHAP values for a subset (first 50 rows) of test data for Random Forest
+rf_sample <- test_70 %>% select(SMB, HML) %>% slice(1:50)
+shap_rf <- explain(rf_model,
+X = rf_sample,
+pred_wrapper = pred_rf,
+nsim = 50) # Number of Monte Carlo simulations
+# Plot SHAP summary for Random Forest
+plot(shap_rf, main = "SHAP Values - Random Forest")
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Compute SHAP values for LASSO on the same sample of test data
+lasso_sample <- test_70 %>% select(SMB, HML) %>% slice(1:50)
+shap_lasso <- explain(cv_lasso,
+X = as.matrix(lasso_sample),
+pred_wrapper = pred_lasso,
+nsim = 50)
+# Plot SHAP summary for LASSO
+plot(shap_lasso, main = "SHAP Values - LASSO")
+```
+
+```{r, message=FALSE, warning=FALSE}
+# A scatter plot is created for LASSO predictions vs actual target values (70/30 split).
+# Includes a diagonal red dashed line to visualize perfect prediction.
+# Scatter Plot for LASSO (70/30 Split): Predicted vs. Actual
+lasso_actual_vs_pred <- data.frame(Actual = y_test, Predicted = as.vector(lasso_pred))
+ggplot(lasso_actual_vs_pred, aes(x = Actual, y = Predicted)) +
+geom_point(color = "blue", alpha = 0.6) +
+geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+labs(title = "LASSO (70/30): Predicted vs. Actual",
+x = "Actual Market Excess Return",
+y = "Predicted Market Excess Return") +
+theme_minimal()
+```
