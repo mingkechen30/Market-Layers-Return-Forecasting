@@ -1,0 +1,200 @@
+---
+title: "Appendix 3: Scenario 3 - Individual Stock Perspective (TSLA vs KO)"
+output: html_document
+date: "2025-04-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(glmnet)
+library(randomForest)
+library(zoo)
+library(caret)
+library(Metrics)
+library(ggplot2)
+library(tidyr)
+
+set.seed(423)
+make_features <- function(path) {
+df <- readxl::read_excel(path) %>%
+# 1) Rename your actual columns to `date` and `index`
+dplyr::rename(
+date = Dates,
+index = `Share Pricing`
+) %>%
+dplyr::arrange(date) %>% # ensure chronological order
+# 2) Compute today's log-return and tomorrow's return as the target
+dplyr::mutate(
+log_ret = log(index / dplyr::lag(index)),
+target = dplyr::lead(log_ret)
+) %>%
+# 3) For every other column (the ratios), create lag1, lag2, and 5-day rolling mean
+dplyr::mutate(across(
+-c(date, index, log_ret, target),
+list(
+lag1 =~dplyr::lag(., 1),
+lag2 =~dplyr::lag(., 2),
+roll5 =~zoo::rollapplyr(., width = 5, mean, fill = NA)
+),
+.names = "{.col}_{.fn}"
+)) %>%
+# 4) Drop any rows missing returns, target, or engineered features
+dplyr::filter(!is.na(log_ret), !is.na(target)) %>%
+tidyr::drop_na()
+# 5) Return:
+# - X: matrix of all ratio-based features
+# - y: next-day log-return
+# - dates: the date vector for plotting
+list(
+X = df %>% dplyr::select(-date,-index,-log_ret,-target) %>% as.matrix(),
+y = df$target,
+dates = df$date
+)
+}
+# Apply the function to both TSLA and KO:
+tsla <- make_features("TSLA 10-Year Daily Return.xls")
+ko <- make_features("KO 10-Year Daily Return.xls")
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Train/Test Split & Model Fitting
+train_fracs <- c(0.7, 0.8)
+all_stats <- list()
+# helper: time-based split
+split_fun <- function(obj, frac) {
+n <- nrow(obj$X)
+i <- floor(n * frac)
+list(
+Xtr = obj$X[1:i, ], ytr = obj$y[1:i],
+Xte = obj$X[(i+1):n, ], yte = obj$y[(i+1):n]
+)
+}
+# helper: fit OLS, LASSO, RF; compute MSE, MAE, R2, Corr
+fit_eval <- function(Xtr, ytr, Xte, yte) {
+# OLS baseline
+df_tr <- as.data.frame(Xtr); df_tr$y <- ytr
+lm_mod <- lm(y~
+., data = df_tr)
+p_lm <- predict(lm_mod, newdata = as.data.frame(Xte))
+# LASSO with CV
+cv_l <- cv.glmnet(Xtr, ytr, alpha = 1)
+p_l <- predict(cv_l, s = cv_l$lambda.min, newx = Xte)
+# Random Forest
+rf_mod <- randomForest(
+x = Xtr,
+y = ytr,
+mtry = floor(sqrt(ncol(Xtr))),
+ntree = 500,
+maxnodes = 30,
+importance = TRUE
+)
+p_rf <- predict(rf_mod, newdata = Xte)
+# collect metrics
+tibble::tibble(
+Model = c("OLS", "LASSO", "RandomForest"),
+MSE = c(mse(yte, p_lm), mse(yte, p_l), mse(yte, p_rf)),
+MAE = c(mae(yte, p_lm), mae(yte, p_l), mae(yte, p_rf)),
+R2 = c(
+1- sum((p_lm- yte)^2)/sum((yte- mean(yte))^2),
+1- sum((p_l- yte)^2)/sum((yte- mean(yte))^2),
+1- sum((p_rf- yte)^2)/sum((yte- mean(yte))^2)
+),
+Corr = c(cor(p_lm, yte), cor(p_l, yte), cor(p_rf, yte))
+)
+}
+# loop over train_fracs and symbols
+symbols <- list("TSLA" = tsla, "KO" = ko)
+for (fr in train_fracs) {
+for (name in names(symbols)) {
+obj <- symbols[[name]]
+sp <- split_fun(obj, fr)
+stats <- fit_eval(sp$Xtr, sp$ytr, sp$Xte, sp$yte) %>%
+mutate(Symbol = name, Split = fr)
+all_stats[[paste(name, fr, sep = "_")]] <- stats
+}
+}
+# combine results
+tsla_ko_results <- bind_rows(all_stats)
+print(tsla_ko_results)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Visualization
+# MSE by Model & Split
+ggplot(tsla_ko_results, aes(x = Model, y = MSE, fill = factor(Split))) +
+geom_col(position = "dodge") +
+facet_wrap(~Symbol) +
+labs(
+title = "Out‑of‑Sample MSE by Model & Train/Split (TSLA vs KO)",
+x = "Model",
+y = "Mean Squared Error (MSE)",
+fill = "Train Frac"
+) +
+theme_minimal()
+```
+
+```{r, message=FALSE, warning=FALSE}
+# LASSO Improvement over OLS (ΔMSE)
+imp <- tsla_ko_results %>%
+select(Symbol, Split, Model, MSE) %>%
+pivot_wider(
+id_cols = c(Symbol, Split),
+names_from = Model,
+values_from = MSE
+) %>%
+mutate(Delta = OLS- LASSO)
+ggplot(imp, aes(x = factor(Split), y = Delta, color = Symbol, group = Symbol)) +
+  geom_line() +
+  geom_point(size = 3) +
+  labs(
+    title = "LASSO Improvement over OLS (ΔMSE)",
+    x = "Train Fraction",
+    y = expression(MSE[OLS]- MSE[LASSO])) +
+  theme_minimal()
+```
+
+```{r, message=FALSE, warning=FALSE}
+# R² Comparison & ΔR²
+# (a) R² by Model
+ggplot(tsla_ko_results, aes(x = Model, y = R2, fill = factor(Split))) +
+geom_col(position = "dodge") +
+facet_wrap(~Symbol) +
+labs(
+title = expression("Out‑of‑Sample " * R^2 * " by Model & Train/Split"),
+x = "Model",
+y = expression(R^2),
+fill = "Train Frac"
+) +
+theme_minimal()
+```
+
+```{r, message=FALSE, warning=FALSE}
+# (b) ΔR²
+imp_R2 <- tsla_ko_results %>%
+select(Symbol, Split, Model, R2) %>%
+pivot_wider(
+id_cols = c(Symbol, Split),
+names_from = Model,
+values_from = R2
+) %>%
+mutate(Delta_R2 = LASSO- OLS)
+ggplot(imp_R2, aes(x = factor(Split), y = Delta_R2, color = Symbol, group = Symbol)) +
+geom_point(size = 3) +
+geom_line() +
+labs(
+title = expression("LASSO Improvement over OLS (" * Delta * R^2 * ")"),
+x = "Train Fraction",
+y = expression(R^2[LASSO]- R^2[OLS])
+) +
+theme_minimal()
+```
+
+
+
+
