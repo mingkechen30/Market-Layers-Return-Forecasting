@@ -1,0 +1,198 @@
+---
+title: "Appendix 2: Scenario 2 - Index Perspective (Nasdaq vs Dow Jones)"
+output: html_document
+date: "2025-04-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(glmnet)
+library(randomForest)
+library(zoo)
+library(Metrics)
+library(ggplot2)
+library(tidyr)
+
+set.seed(423)
+# Feature‐engineering function (lags + 5-day rolling): Reads an index file,
+# computes today’s log‐return and tomorrow’s target and Adds lag‐1, lag‐2,
+# and 5‐day rolling‐mean versions of every ratio and drops any rows
+# with missing values
+make_features <- function(path) {
+df <- read_excel(path) %>%
+rename(date = Dates, index = `Index Value`) %>%
+arrange(date) %>%
+# compute daily log-return and set next day as target
+mutate(
+log_ret = log(index/lag(index)),
+target = lead(log_ret)
+) %>%
+# for each ratio column, add lag1, lag2, and 5-day rolling mean
+mutate(across(
+-c(date,index,log_ret,target),
+list(lag1 =~lag(.,1),
+lag2 =~lag(.,2),
+roll5 =~rollapplyr(., width=5, mean, fill=NA)),
+.names = "{.col}_{.fn}"
+)) %>%
+# remove rows where log_ret, target, or any feature is NA
+filter(!is.na(log_ret), !is.na(target)) %>%
+drop_na()
+# extract feature matrix X, response y, and dates
+list(
+X = df %>% select(-date,-index,-log_ret,-target) %>% as.matrix(),
+y = df$target,
+dates = df$date
+)
+}
+# generate features for Dow Jones and Nasdaq
+dow <- make_features("DOWJONES 10-Year Daily Return.xlsx")
+ndq <- make_features("NASDAQ 10-Year Daily Return.xlsx")
+```
+
+```{r, message=FALSE, warning=FALSE}
+# We loop over two splits (70/30 and 80/20),
+# we split by time and fit OLS (baseline), LASSO (with CV), and Random Forest
+# Then compute out‑of‑sample MSE, MAE, R², and correlation
+train_fracs <- c(0.7, 0.8)
+all_stats <- list()
+for(fr in train_fracs) {
+# split function (first fr% train, rest test)
+split_fun <- function(obj) {
+n <- nrow(obj$X)
+i <- floor(n * fr)
+list(
+Xtr = obj$X[1:i, ], ytr = obj$y[1:i],
+Xte = obj$X[(i+1):n, ], yte = obj$y[(i+1):n]
+)
+}
+dow_sp <- split_fun(dow)
+ndq_sp <- split_fun(ndq)
+# Function to fit and collect metrics
+fit_eval <- function(Xtr, ytr, Xte, yte) {
+# OLS
+df_tr <- as.data.frame(Xtr); df_tr$y <- ytr
+lm_mod <- lm(y~
+., data=df_tr)
+p_lm <- predict(lm_mod, newdata=as.data.frame(Xte))
+# LASSO
+cv_l <- cv.glmnet(Xtr, ytr, alpha=1)
+p_l <- predict(cv_l, s=cv_l$lambda.min, newx=Xte)
+# RF
+rf_mod <- randomForest(x=Xtr, y=ytr,
+mtry=floor(sqrt(ncol(Xtr))),
+ntree=500, maxnodes=30)
+p_rf <- predict(rf_mod, newdata=Xte)
+# collect metrics
+stats <- tibble::tibble(
+Model = c("OLS","LASSO","RandomForest"),
+MSE = c(mse(yte,p_lm), mse(yte,p_l), mse(yte,p_rf)),
+MAE = c(mae(yte,p_lm), mae(yte,p_l), mae(yte,p_rf)),
+R2 = c(1-sum((p_lm-yte)^2)/sum((yte-mean(yte))^2),
+1-sum((p_l-yte)^2)/sum((yte-mean(yte))^2),
+1-sum((p_rf-yte)^2)/sum((yte-mean(yte))^2)),
+Corr = c(cor(p_lm,yte), cor(p_l,yte), cor(p_rf,yte))
+)
+return(stats)
+}
+# Collect for Dow & Nasdaq
+dow_stats <- fit_eval(dow_sp$Xtr, dow_sp$ytr, dow_sp$Xte, dow_sp$yte) %>%
+mutate(Index="Dow Jones", Split=fr)
+ndq_stats <- fit_eval(ndq_sp$Xtr, ndq_sp$ytr, ndq_sp$Xte, ndq_sp$yte) %>%
+mutate(Index="Nasdaq", Split=fr)
+all_stats[[as.character(fr)]] <- bind_rows(dow_stats, ndq_stats)
+}
+results <- bind_rows(all_stats)
+# View numeric table
+print(results)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# MSE by Model / Split / Index
+ggplot(results, aes(x=Model, y=MSE, fill=factor(Split))) +
+geom_col(position="dodge") +
+facet_wrap(~Index) +
+labs(title="Out-of-Sample MSE by Model & Train/Split",
+fill="Train/Frac", y="MSE") +
+theme_minimal()
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+# Keep only the columns related for ΔMSE
+imp <- results %>%
+select(Index, Split, Model, MSE) %>%
+# Pivot so that each row is one Index/Split
+pivot_wider(
+id_cols = c(Index, Split),
+names_from= Model,
+values_from = MSE
+) %>%
+# Compute Δ = MSE(OLS) − MSE(LASSO)
+mutate(Delta = OLS- LASSO)
+ggplot(imp, aes(x=factor(Split), y=Delta, color=Index, group=Index)) +
+geom_line() + geom_point(size=3) +
+labs(title="LASSO Improvement over OLS (ΔMSE)",
+x="Train/Frac", y="MSE(OLS)-MSE(LASSO)") +
+theme_minimal()
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Compare LASSO vs RF directly
+ggplot(results %>% filter(Model!="OLS"),
+aes(x=Model, y=MSE, fill=Model)) +
+geom_col() +
+facet_grid(Index~Split) +
+labs(title="MSE: LASSO vs Random Forest",
+y="MSE") +
+theme_minimal()
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+# Bar chart of R-squared by Model / Split / Index
+ggplot(results, aes(x=Model, y=R2, fill=factor(Split))) +
+geom_col(position="dodge") +
+facet_wrap(~Index) +
+labs(
+title = "Out-of-Sample R² by Model & Train/Split",
+x = "Model",
+y = expression(R^2),
+fill = "Train/Frac"
+) +
+theme_minimal()
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Compute ΔR² = R²(LASSO) - R²(OLS)
+imp_R2 <- results %>%
+select(Index, Split, Model, R2) %>%
+pivot_wider(
+id_cols = c(Index, Split),
+names_from = Model,
+values_from= R2
+) %>%
+mutate(Delta_R2 = LASSO- OLS)
+print(imp_R2)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# 3) Plot ΔR²
+ggplot(imp_R2, aes(x=factor(Split), y=Delta_R2, color=Index, group=Index)) +
+geom_point(size=3) +
+geom_line() +
+labs(
+title = expression("LASSO Improvement over OLS ("*Delta*R^2*")"),
+x = "Train Fraction",
+y = expression(R^2[LASSO]- R^2[OLS])) +
+  theme_minimal()
+```
